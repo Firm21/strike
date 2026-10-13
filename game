@@ -1,0 +1,965 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Night Game Showdown</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Alfa+Slab+One&family=Barlow+Condensed:wght@600;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  box-sizing:border-box;
+  padding-top:env(safe-area-inset-top,0px);
+  padding-bottom:env(safe-area-inset-bottom,0px);
+  --bg:#dfe8da; --ink:#13231a;
+}
+html{scroll-padding-top:env(safe-area-inset-top,0px);height:100%}
+@media (prefers-color-scheme:dark){
+  :root:not([data-theme="light"]){--bg:#070d12;--ink:#e9f0e6}
+}
+:root[data-theme="dark"]{--bg:#070d12;--ink:#e9f0e6}
+body{
+  margin:0;height:100%;background:var(--bg);color:var(--ink);
+  font-family:"Barlow Condensed","Arial Narrow",system-ui,sans-serif;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;
+}
+.wrap{position:relative;width:min(100vw,calc(100svh * 2 / 3),520px)}
+canvas{
+  display:block;width:100%;height:auto;aspect-ratio:2/3;touch-action:none;cursor:crosshair;
+  -webkit-tap-highlight-color:transparent;user-select:none;
+  box-shadow:0 0 0 1px rgba(255,255,255,.06);
+}
+#lobby{
+  position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:14px;padding:24px;box-sizing:border-box;background:rgba(5,10,20,.9);color:#e9f0e6;text-align:center;
+}
+#lobby[hidden]{display:none}
+#lobby h2{font-family:"Alfa Slab One",Georgia,serif;font-weight:400;font-size:34px;margin:0;color:#ffd95a}
+#lstat{font-size:22px;line-height:1.25;margin:0;max-width:340px;min-height:56px}
+#lobby button{
+  font:700 26px "Barlow Condensed","Arial Narrow",system-ui,sans-serif;background:#f2c230;color:#0b1428;
+  border:0;padding:10px 26px;min-width:220px;cursor:pointer;
+}
+#lobby button.ghost{background:transparent;color:#b8c5de;border:1px solid rgba(255,255,255,.3);min-width:0}
+#lobby button:focus-visible,#lobby input:focus-visible{outline:3px solid #fff;outline-offset:2px}
+#lobby .row{display:flex;gap:8px}
+#lobby input{
+  font:700 28px "Barlow Condensed","Arial Narrow",system-ui,sans-serif;width:130px;text-align:center;
+  text-transform:uppercase;background:#0f1a2e;color:#fff;border:1px solid rgba(255,255,255,.35);padding:8px;
+}
+#lobby .row button{min-width:0;padding:10px 20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <canvas id="c" aria-label="Two-player baseball game. You alternate between batting and pitching."></canvas>
+  <div id="lobby" hidden>
+    <h2>Play online</h2>
+    <p id="lstat">Create a game and send the code to a friend, or enter the code they sent you.</p>
+    <button id="bcreate">Create game</button>
+    <div class="row"><input id="code" maxlength="6" placeholder="Code" autocomplete="off" autocapitalize="characters" aria-label="Game code"><button id="bjoin">Join</button></div>
+    <button id="bback" class="ghost">Back</button>
+  </div>
+</div>
+<script>
+(() => {
+"use strict";
+const cv = document.getElementById("c"), ctx = cv.getContext("2d");
+const W = 480, H = 720, CX = 240;
+const BZ = {y:480, w:44, h:50};      // strike zone in batter's view
+const PZ = {y:330, w:46, h:56};      // strike zone in pitcher's view
+const RX = 240, RY = 604;            // pitcher's-view release point
+const SX = 240, SY = 256;            // batter's-view release point
+const INN = 3, MAXINN = 6;
+const DISPLAY = '"Alfa Slab One", "Rockwell", Georgia, serif';
+const BODY = '"Barlow Condensed", "Arial Narrow", system-ui, sans-serif';
+
+function fit(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
+  cv.width = W * dpr; cv.height = H * dpr;
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+}
+fit(); window.addEventListener("resize", fit);
+
+const rand = (a,b) => a + Math.random()*(b-a);
+const clamp = (v,a,b) => Math.max(a, Math.min(b, v));
+const lerp = (a,b,t) => a + (b-a)*t;
+const num = (v,a,b,d) => (typeof v === "number" && isFinite(v)) ? clamp(v,a,b) : d;
+
+/* ---------- audio ---------- */
+let AC = null;
+function tone(f, d, type="square", vol=0.07, slide=0){
+  try{
+    AC = AC || new (window.AudioContext || window.webkitAudioContext)();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = type; o.frequency.value = f;
+    if (slide) o.frequency.linearRampToValueAtTime(f+slide, AC.currentTime + d);
+    g.gain.value = vol; g.gain.exponentialRampToValueAtTime(0.0001, AC.currentTime + d);
+    o.connect(g); g.connect(AC.destination); o.start(); o.stop(AC.currentTime + d);
+  }catch(e){}
+}
+const sndThrow = () => tone(420,.18,"sine",.05,-260);
+const sndHit   = () => { tone(210,.09,"square",.1,-80); tone(1100,.05,"triangle",.06); };
+const sndMiss  = () => tone(150,.14,"sawtooth",.05,-70);
+const sndCall  = () => tone(330,.08,"triangle",.05);
+const sndWin   = () => [523,659,784,1047].forEach((f,i)=>setTimeout(()=>tone(f,.16,"triangle",.07),i*90));
+
+/* ---------- data ---------- */
+const PITCHES = [
+  {name:"Fastball",  desc:"Fast, straight", mph:[91,99], dur:[.80,.90],  scatter:20, off:[0,-8],   contact:0},
+  {name:"Slider",    desc:"Bites away",     mph:[83,89], dur:[.98,1.08], scatter:28, off:[38,0],   contact:-.08},
+  {name:"Curveball", desc:"Big drop",       mph:[72,80], dur:[1.25,1.38],scatter:36, off:[0,-52],  contact:-.10},
+  {name:"Changeup",  desc:"Ruins timing",   mph:[76,83], dur:[1.18,1.30],scatter:26, off:[-16,-16],contact:-.04},
+];
+const BATTERS = [
+  {name:"Slugger",        contact:-.04, power:1.8, chase:0},
+  {name:"Contact hitter", contact: .08, power:.5,  chase:0},
+  {name:"Rookie",         contact:-.08, power:.8,  chase:.22},
+  {name:"Veteran",        contact:0,    power:1,   chase:.05},
+];
+const WEIGHTS = {
+  heart:{foul:.16,ground:.22,fly:.20,single:.22,double:.10,triple:.02,hr:.10},
+  edge: {foul:.28,ground:.30,fly:.20,single:.13,double:.06,triple:.01,hr:.03},
+  out:  {foul:.30,ground:.35,fly:.22,single:.09,double:.03,triple:0,hr:.01},
+};
+const FDUR = {hr:1.5, fly:1.35, single:.9, double:1.05, triple:1.15, ground:.85, foul:1.05};
+const IN_PLAY = ["ground","fly","single","double","triple","hr","foul"];
+const ALL_KINDS = ["ball","called","whiff"].concat(IN_PLAY);
+const BTN = PITCHES.map((p,i) => ({x:12 + i*117, y:630, w:109, h:72, i}));
+const MENU_BTN = [
+  {x:90,y:340,w:300,h:56,label:"Play the computer", act:"cpu"},
+  {x:90,y:410,w:300,h:56,label:"Pass and play",     act:"pass"},
+  {x:90,y:480,w:300,h:56,label:"Play online",       act:"online"},
+];
+const GOOD = "#9fe0b5", BAD = "#ff9d8a", NEUT = "#ffd95a", COOL = "#cfe3ff";
+
+/* ---------- state ---------- */
+// G is the real game state. V is what the scoreboard shows (updated when a banner appears).
+const G = {inning:1, half:"top", outs:0, balls:0, strikes:0, bases:[0,0,0], score:[0,0], over:false, winner:-1};
+let V = snapG();
+const S = {
+  phase:"menu", view:"pitch", mode:"cpu", me:0, ctrl:["human","cpu"], names:["You","CPU"], full:["You","CPU"],
+  sel:0, aim:{x:CX,y:PZ.y}, meter:{m:0,dir:1}, pitch:null, flight:null, bat:null, banner:null, after:null,
+  timer:0, particles:[], pointer:{x:CX,y:PZ.y}, prevMph:0, prevType:-1, streak:0, cpuBatter:BATTERS[0],
+  handoff:null, lastActor:-1, inbox:null, pending:null, seq:0, info:"", msg:"", msgT:0, overAt:0
+};
+const batSide = () => G.half === "top" ? 0 : 1;
+const pitSide = () => 1 - batSide();
+
+function snapG(){
+  return {inning:G.inning, half:G.half, outs:G.outs, balls:G.balls, strikes:G.strikes,
+    bases:G.bases.slice(), score:G.score.slice(), over:G.over, winner:G.winner};
+}
+function adoptG(s){
+  G.inning = num(s.inning,1,MAXINN+1,1); G.half = s.half === "bot" ? "bot" : "top";
+  G.outs = num(s.outs,0,2,0); G.balls = num(s.balls,0,3,0); G.strikes = num(s.strikes,0,2,0);
+  G.bases = [0,1,2].map(i => (s.bases && s.bases[i]) ? 1 : 0);
+  G.score = [num(s.score && s.score[0],0,99,0), num(s.score && s.score[1],0,99,0)];
+  G.over = !!s.over; G.winner = num(s.winner,-1,1,-1);
+}
+
+function setNames(){
+  if (S.mode === "cpu"){ S.names = ["You","CPU"]; S.full = ["You","CPU"]; S.ctrl = ["human","cpu"]; }
+  else if (S.mode === "pass"){ S.names = ["P1","P2"]; S.full = ["Player 1","Player 2"]; S.ctrl = ["human","human"]; }
+  else {
+    S.names = ["Opp","Opp"]; S.full = ["Opponent","Opponent"];
+    S.names[S.me] = "You"; S.full[S.me] = "You";
+    S.ctrl = ["remote","remote"]; S.ctrl[S.me] = "human";
+  }
+}
+
+function startGame(mode, me){
+  S.mode = mode; S.me = me || 0; setNames();
+  Object.assign(G,{inning:1,half:"top",outs:0,balls:0,strikes:0,bases:[0,0,0],score:[0,0],over:false,winner:-1});
+  V = snapG();
+  Object.assign(S,{sel:0,aim:{x:CX,y:PZ.y},pitch:null,flight:null,bat:null,banner:null,after:null,particles:[],
+    prevMph:0,prevType:-1,streak:0,handoff:null,lastActor:-1,inbox:null,pending:null,seq:0,info:"",msg:""});
+  newCpuBatter();
+  beginPitch();
+}
+const newCpuBatter = () => { S.cpuBatter = BATTERS[Math.floor(Math.random()*BATTERS.length)]; };
+
+/* ---------- pitch pipeline ---------- */
+function gotoActor(side, phase, view){
+  if (view) S.view = view;
+  if (S.mode === "pass" && S.lastActor !== side){
+    const role = side === pitSide() ? "pitcher" : "batter";
+    S.phase = "handoff"; S.handoff = {side, role, phase};
+  } else { S.phase = phase; S.lastActor = side; }
+}
+function beginPitch(){
+  S.pitch = null; S.flight = null; S.bat = null; S.banner = null; S.after = null; S.info = ""; S.pending = null;
+  const pit = pitSide();
+  if (S.ctrl[pit] === "human"){
+    S.view = "pitch"; gotoActor(pit, "aim", "pitch");
+  } else if (S.ctrl[pit] === "cpu"){
+    startFlight(cpuSpec());
+  } else {
+    S.view = "bat"; S.phase = "wait";
+    if (S.inbox && S.inbox.seq === S.seq){ const d = S.inbox; S.inbox = null; startFlight(d); }
+  }
+}
+
+function startFlight(spec){
+  const bat = batSide(), p = {
+    type:spec.type, mph:spec.mph, dur:spec.dur, nx:spec.nx, ny:spec.ny, t:0, resolved:false, swung:false,
+    ax:spec.ax, ay:spec.ay
+  };
+  const d = Math.max(Math.abs(p.nx), Math.abs(p.ny));
+  p.inZone = d <= 1; p.region = d < .45 ? "heart" : d <= 1 ? "edge" : "out"; p.d = d;
+  if (S.ctrl[bat] === "cpu") p.cpu = cpuDecide(p);
+  S.streak = (S.prevType === p.type) ? S.streak + 1 : 1; S.prevType = p.type; S.prevMph = p.mph;
+  S.pitch = p; S.info = PITCHES[p.type].name + "  " + p.mph + " mph"; S.pending = null;
+  sndThrow();
+  if (S.ctrl[bat] === "human") gotoActor(bat, "flight", "bat");
+  else { S.view = "pitch"; S.phase = "flight"; }
+}
+
+/* human pitcher */
+const meterError = () => Math.min(1, Math.abs(S.meter.m - .5) * 2);
+const scatterR = e => PITCHES[S.sel].scatter * (.12 + 1.35*e);
+
+function release(){
+  const T = PITCHES[S.sel], e = meterError();
+  const R = scatterR(e), ang = rand(0, Math.PI*2), rr = R*Math.sqrt(Math.random());
+  const tx = clamp(S.aim.x + Math.cos(ang)*rr, CX-150, CX+150);
+  const ty = clamp(S.aim.y + Math.sin(ang)*rr, PZ.y-135, PZ.y+135);
+  const spec = {
+    seq:S.seq, type:S.sel, mph:Math.round(rand(T.mph[0], T.mph[1])),
+    dur:+(rand(T.dur[0], T.dur[1]) * (1 - .015*(G.inning-1))).toFixed(3),
+    nx:+((tx-CX)/PZ.w).toFixed(3), ny:+((ty-PZ.y)/PZ.h).toFixed(3), ax:S.aim.x, ay:S.aim.y
+  };
+  if (S.mode === "online" && S.ctrl[batSide()] === "remote"){
+    const {ax,ay,...wire} = spec; send("pitch", wire);
+  }
+  startFlight(spec);
+  S.pitch.perfect = e < .1;
+}
+
+/* CPU pitcher */
+function cpuSpec(){
+  let r = Math.random(), type = r < .4 ? 0 : r < .6 ? 1 : r < .8 ? 2 : 3;
+  const T = PITCHES[type];
+  let nx, ny;
+  if (Math.random() < .62){
+    if (Math.random() < .5){ nx = rand(-.8,.8); ny = rand(-.8,.8); }
+    else {
+      const a = (Math.random()<.5?-1:1)*rand(.55,.95), b = rand(-.9,.9);
+      if (Math.random()<.5){ nx = a; ny = b; } else { nx = b; ny = a; }
+    }
+  } else {
+    const a = (Math.random()<.5?-1:1)*rand(1.1,1.8), b = rand(-1.2,1.2);
+    if (Math.random()<.5){ nx = a; ny = b; } else { nx = b; ny = a; }
+  }
+  return {seq:S.seq, type, mph:Math.round(rand(T.mph[0],T.mph[1])),
+    dur:rand(T.dur[0],T.dur[1])*(1-.015*(G.inning-1)), nx, ny};
+}
+
+/* CPU batter */
+function cpuDecide(p){
+  const B = S.cpuBatter, T = PITCHES[p.type], region = p.region, d = p.d;
+  let sw = region === "heart" ? .88 : region === "edge" ? .68 : (d < 1.6 ? .32 : .10);
+  if (region === "out") sw += B.chase;
+  if (G.strikes === 2) sw += region === "heart" ? .1 : .15;
+  const swing = Math.random() < clamp(sw,.03,.97);
+  let c = .74 + (region === "heart" ? .08 : region === "edge" ? -.08 : -.28);
+  c += T.contact;
+  if (p.type === 0) c -= (p.mph - 88) * .010;
+  if (S.prevMph) c -= clamp((Math.abs(p.mph - S.prevMph) - 5) * .012, 0, .16);
+  if (S.streak >= 2 && S.prevType === p.type) c += .12;
+  c += .02*(G.inning-1) + B.contact;
+  const contact = swing && Math.random() < clamp(c,.08,.9);
+  let kind = null, lat = rand(-1,1);
+  if (contact){
+    const w = Object.assign({}, WEIGHTS[region]);
+    w.hr *= B.power; w.double *= 1 + (B.power-1)*.5;
+    let tot = 0; for (const k in w) tot += w[k];
+    let r = Math.random()*tot; kind = "ground";
+    for (const k in w){ if ((r -= w[k]) < 0){ kind = k; break; } }
+    if (kind === "foul") lat = (Math.random()<.5?-1:1)*rand(1.15,1.3);
+  }
+  return {swing, contact, kind, lat};
+}
+
+/* ---------- ball positions ---------- */
+function ballPitchView(p, z){
+  const T = PITCHES[p.type], h = Math.sin(Math.PI*Math.min(z,1));
+  const tx = CX + p.nx*PZ.w, ty = PZ.y + p.ny*PZ.h;
+  return {x:lerp(RX,tx,z)+T.off[0]*h, y:lerp(RY,ty,z)+T.off[1]*h, r:lerp(20,8,Math.pow(Math.min(z,1),.8))};
+}
+function ballBatView(p, z){
+  const T = PITCHES[p.type], h = Math.sin(Math.PI*Math.min(z,1)), u = Math.max(z,0);
+  const tx = CX - p.nx*BZ.w, ty = BZ.y + p.ny*BZ.h;
+  return {x:SX+(tx-SX)*u - T.off[0]*.8*h, y:SY+(ty-SY)*Math.pow(u,1.35) + T.off[1]*.8*h, r:3+20*Math.pow(u,1.7)};
+}
+
+/* ---------- human batter ---------- */
+function swing(px,py){
+  const p = S.pitch;
+  if (S.phase !== "flight" || S.view !== "bat" || !p || p.swung || p.resolved) return;
+  p.swung = true; S.bat = {t:0, x:px, y:py};
+  const z = p.t / p.dur, dz = z - 1, b = ballBatView(p, z), d = Math.hypot(px-b.x, py-b.y);
+  if (Math.abs(dz) < .15 && d < 62){
+    p.resolved = true; p.zc = Math.min(z,1.05);
+    const qt = 1 - Math.abs(dz)/.15, qd = 1 - d/62, q = .6*qt + .4*qd;
+    const timing = Math.abs(dz) < .03 ? "Perfect timing" : (dz < 0 ? "A little early" : "A little late");
+    let lat = clamp((clamp(CX + dz*1400 + (px - b.x)*2.2, 40, 440) - CX)/220, -1, 1), kind;
+    if (q < .28){ kind = "foul"; lat = (dz < 0 ? -1 : 1)*rand(1.15,1.25); }
+    else {
+      let r = Math.random();
+      const hrP = q > .6 ? (q-.6)*1.8 : 0, trP = q > .8 ? .04 : 0, dbP = q > .5 ? (q-.5)*.9 : 0, sP = .12 + .35*q;
+      if ((r -= hrP) < 0) kind = "hr";
+      else if ((r -= trP) < 0) kind = "triple";
+      else if ((r -= dbP) < 0) kind = "double";
+      else if ((r -= sP) < 0) kind = "single";
+      else kind = Math.random() < .55 ? "ground" : "fly";
+    }
+    sndHit();
+    resolveLocal(kind, lat, true, timing);
+  } else sndMiss();
+}
+
+/* ---------- outcomes ---------- */
+function runsText(n){ return n ? "+" + n + (n===1?" run":" runs") : ""; }
+function endPA(){ G.balls = 0; G.strikes = 0; newCpuBatter(); }
+function addOut(){
+  G.outs++; endPA();
+  if (G.outs < 3) return false;
+  G.outs = 0; G.bases = [0,0,0];
+  if (G.half === "top"){
+    if (G.inning >= INN && G.score[1] > G.score[0]){ G.over = true; G.winner = 1; }
+    else G.half = "bot";
+  } else {
+    if (G.inning >= INN && G.score[0] !== G.score[1]){ G.over = true; G.winner = G.score[0] > G.score[1] ? 0 : 1; }
+    else if (G.inning >= MAXINN){ G.over = true; G.winner = -1; }
+    else { G.inning++; G.half = "top"; }
+  }
+  return true;
+}
+function advance(n){
+  let scored = 0; const nb = [0,0,0];
+  for (let i=2;i>=0;i--) if (G.bases[i]){
+    const ni = i + n;
+    if (ni >= 3) scored++; else nb[ni] = 1;
+  }
+  nb[n-1] = 1; G.bases = nb; return scored;
+}
+
+function applyKind(kind, extra){
+  const bs = batSide(), half0 = G.half;
+  let text = "", sub = "", gb = 0, dur = 1.1, sc = 0, sideOut = false;
+  switch (kind){
+    case "ball":
+      G.balls++;
+      if (G.balls >= 4){
+        const b = G.bases;
+        if (b[0]){ if (b[1]){ if (b[2]) sc++; b[2] = 1; } b[1] = 1; }
+        b[0] = 1; endPA(); text = "Walk"; sub = sc ? runsText(sc) + " forced in" : "Take your base"; gb = 1;
+      } else { text = "Ball " + G.balls; dur = .75; }
+      break;
+    case "called": case "whiff":
+      G.strikes++; gb = -1;
+      if (G.strikes >= 3){ text = kind === "whiff" ? "Strikeout!" : "Struck out looking"; dur = 1.2; sideOut = addOut(); }
+      else { text = kind === "whiff" ? "Swing and a miss" : "Strike " + G.strikes; sub = kind === "whiff" ? "Strike " + G.strikes : "Called"; dur = .8; }
+      break;
+    case "foul":
+      if (G.strikes < 2) G.strikes++;
+      text = "Foul ball"; sub = extra || (G.strikes >= 2 ? "Two strikes" : "Strike " + G.strikes); dur = .85; extra = "";
+      break;
+    case "ground":
+      gb = -1; text = "Grounded out";
+      if (G.bases[0] && G.outs < 2 && Math.random() < .35){ G.bases[0] = 0; G.outs++; text = "Double play"; }
+      sideOut = addOut(); break;
+    case "fly":
+      gb = -1; text = "Flied out";
+      if (G.bases[2] && G.outs < 2 && Math.random() < .5){ G.bases[2] = 0; sc = 1; text = "Sacrifice fly"; gb = 0; }
+      sideOut = addOut(); break;
+    case "single": sc = advance(1); endPA(); text = "Single"; gb = 1; dur = 1.2; break;
+    case "double": sc = advance(2); endPA(); text = "Double"; gb = 1; dur = 1.2; break;
+    case "triple": sc = advance(3); endPA(); text = "Triple!"; gb = 1; dur = 1.3; break;
+    case "hr":     sc = 1 + G.bases[0] + G.bases[1] + G.bases[2]; G.bases = [0,0,0]; endPA(); text = "Home run!"; gb = 1; dur = 1.9; break;
+  }
+  G.score[bs] += sc;
+  if (!G.over && !sideOut && half0 === "bot" && G.inning >= INN && G.score[1] > G.score[0]){
+    G.over = true; G.winner = 1; sub = "Walk-off!";
+  }
+  if (sc && !sub.startsWith("Walk-off")) sub = runsText(sc) + (extra ? "  " + extra : "");
+  else if (sideOut && !sub){
+    sub = G.over ? "That's the game" : "Side retired. " + (G.half === "bot" ? "Bottom " : "Top ") + G.inning;
+  } else if (!sub && extra) sub = extra;
+  return {text, sub, gb, dur};
+}
+
+function resolveLocal(kind, lat, swung, extra){
+  const iBat = S.mode === "online" && S.ctrl[batSide()] === "human";
+  const banner = applyKind(kind, extra);
+  const o = {seq:S.seq, kind, lat:+lat.toFixed(2), swing:!!swung, banner, snap:snapG()};
+  S.seq++;
+  if (iBat) send("result", o);
+  present(o);
+}
+
+function present(o){
+  S.after = o.banner;
+  if (IN_PLAY.includes(o.kind)){
+    const p = S.pitch;
+    S.flight = {kind:o.kind, lat:o.lat, t:0, dur:FDUR[o.kind], zc:(p && p.zc) || 1};
+    S.phase = "hit";
+  } else {
+    if (o.kind === "whiff") sndMiss(); else sndCall();
+    showBanner(o.banner);
+  }
+}
+
+function showBanner(b){
+  const role = S.view === "bat" ? 1 : -1, eff = (b.gb||0) * role;
+  S.banner = {text:b.text, sub:b.sub, color: eff > 0 ? GOOD : eff < 0 ? BAD : (b.gb ? NEUT : COOL), t:0};
+  S.timer = b.dur; S.phase = "result"; V = snapG();
+  if (b.text === "Home run!") boom(45);
+  if (b.text === "Strikeout!" || b.text === "Struck out looking") boom(16);
+}
+function afterBanner(){
+  S.banner = null;
+  if (G.over){ S.phase = "over"; S.overAt = performance.now(); if (G.winner !== -1) sndWin(); return; }
+  beginPitch();
+}
+
+function boom(n){
+  const cols = ["#ffd95a","#ffffff","#7fd1ff","#9fe0b5"];
+  for (let i=0;i<n;i++) S.particles.push({
+    x:CX+rand(-30,30), y:S.view === "bat" ? 260 : 340, vx:rand(-230,230), vy:rand(-420,-80),
+    c:cols[i%cols.length], life:rand(1,1.8), s:rand(3,6)
+  });
+}
+
+/* ---------- online ---------- */
+let R = null, started = false;
+const lobby = document.getElementById("lobby"), lstat = document.getElementById("lstat");
+const setStat = s => { lstat.textContent = s; };
+
+function send(topic, data){
+  if (!R) return;
+  R.emit(topic, data).catch(e => {
+    if (e && e.code === "not_permitted") flash("Your link is view-only. Ask for edit access to play online.");
+  });
+}
+function flash(m){ S.msg = m; S.msgT = 5; }
+
+async function leaveRoom(){
+  started = false;
+  const r = R; R = null;
+  try { if (r) await r.leave(); } catch(e){}
+}
+
+async function goOnline(code, creating){
+  setStat("Connecting...");
+  let room = null;
+  try { room = window.claude && window.claude.use ? await window.claude.use("room") : null; } catch(e){}
+  if (!room){ setStat("Online play isn't available in this view. Open the shared link while signed in."); return; }
+  try { R = await room.join("ngs-" + code.toLowerCase()); }
+  catch(e){ R = null; setStat("Couldn't join that game (" + ((e && e.code) || "error") + ")."); return; }
+  R.on("pitch", m => { if (!m.isMe) onPitch(m.data); });
+  R.on("result", m => { if (!m.isMe) onResult(m.data); });
+  R.onPeers(onPeers);
+  R.presence({ready:true}).catch(()=>{});
+  setStat(creating ? "Game code: " + code + "\nSend it to a friend. Waiting for them to join..." : "Joined " + code + ". Waiting for the other player...");
+}
+
+function onPeers(change){
+  const people = change.peers.filter(p => p.kind === "viewer").sort((a,b) => a.peer < b.peer ? -1 : 1);
+  if (!started){
+    if (people.length < 2) return;
+    const two = people.slice(0,2), me = two.findIndex(p => p.isMe && p.sameTab);
+    if (me < 0){ setStat("That game already has two players."); return; }
+    started = true; lobby.hidden = true;
+    startGame("online", me);
+  } else if (people.length < 2 && S.phase !== "over" && S.phase !== "menu"){
+    started = false; flash("Your opponent left the game.");
+    S.phase = "menu"; leaveRoom();
+  }
+}
+
+function onPitch(d){
+  if (!d || S.mode !== "online" || S.ctrl[pitSide()] !== "remote" || d.seq !== S.seq) return;
+  const spec = {
+    seq:d.seq, type:Math.floor(num(d.type,0,PITCHES.length-1,0)), mph:Math.round(num(d.mph,50,110,90)),
+    dur:num(d.dur,.5,2,1), nx:num(d.nx,-3,3,0), ny:num(d.ny,-3,3,0)
+  };
+  if (S.phase === "wait") startFlight(spec); else S.inbox = spec;
+}
+function onResult(d){
+  if (!d || S.mode !== "online" || S.ctrl[batSide()] !== "remote" || d.seq !== S.seq) return;
+  if (!ALL_KINDS.includes(d.kind) || !d.banner || !d.snap) return;
+  const b = d.banner;
+  S.pending = {
+    kind:d.kind, lat:num(d.lat,-2,2,0), swing:!!d.swing, snap:d.snap,
+    banner:{text:String(b.text||"").slice(0,40), sub:String(b.sub||"").slice(0,60), gb:num(b.gb,-1,1,0), dur:num(b.dur,.6,2.5,1.1)}
+  };
+}
+function processResult(o){
+  S.pending = null;
+  adoptG(o.snap); S.seq++;
+  if (o.swing && !S.bat) S.bat = {t:.08};
+  present(o);
+}
+
+/* ---------- update ---------- */
+function update(dt){
+  if (S.bat){ S.bat.t += dt; if (S.bat.t > .45) S.bat = null; }
+  for (const q of S.particles){ q.life -= dt; q.vy += 520*dt; q.x += q.vx*dt; q.y += q.vy*dt; }
+  S.particles = S.particles.filter(q => q.life > 0);
+  if (S.banner) S.banner.t += dt;
+  if (S.msgT > 0) S.msgT -= dt;
+
+  switch (S.phase){
+    case "meter": {
+      const m = S.meter; m.m += m.dir * dt * 1.55;
+      if (m.m >= 1){ m.m = 1; m.dir = -1; } else if (m.m <= 0){ m.m = 0; m.dir = 1; }
+      break;
+    }
+    case "flight": {
+      const p = S.pitch; p.t += dt;
+      const z = p.t / p.dur, cb = S.ctrl[batSide()];
+      if (cb === "cpu"){
+        if (p.cpu.swing && !S.bat && z >= 1 - .17/p.dur) S.bat = {t:0};
+        if (z >= 1 && !p.resolved){
+          p.resolved = true; p.zc = 1;
+          if (p.cpu.contact){ sndHit(); resolveLocal(p.cpu.kind, p.cpu.lat, true); }
+          else if (p.cpu.swing) resolveLocal("whiff", 0, true);
+          else resolveLocal(p.inZone ? "called" : "ball", 0, false);
+        }
+      } else if (cb === "human"){
+        if (z >= 1.05 && !p.resolved){
+          p.resolved = true; p.zc = 1;
+          resolveLocal(p.swung ? "whiff" : (p.inZone ? "called" : "ball"), 0, p.swung);
+        }
+      } else if (S.pending && z >= 1 && !p.resolved){
+        p.resolved = true; processResult(S.pending);
+      }
+      break;
+    }
+    case "hit":
+      S.flight.t += dt; if (S.flight.t >= S.flight.dur) showBanner(S.after); break;
+    case "result":
+      S.timer -= dt; if (S.timer <= 0) afterBanner(); break;
+  }
+}
+
+/* ---------- drawing helpers ---------- */
+function txt(s,x,y,size,color,font,align="center",stroke=true){
+  ctx.font = size + "px " + font; ctx.textAlign = align; ctx.textBaseline = "middle";
+  if (stroke){ ctx.lineWidth = Math.max(3,size/6); ctx.strokeStyle = "rgba(6,12,22,.85)"; ctx.lineJoin = "round"; ctx.strokeText(s,x,y); }
+  ctx.fillStyle = color; ctx.fillText(s,x,y);
+}
+function drawBall(x,y,r,shadow){
+  if (shadow){ ctx.fillStyle = "rgba(0,0,0,.18)"; ctx.beginPath(); ctx.ellipse(x, Math.min(y + r*1.4, H), r*.9, r*.28, 0, 0, 7); ctx.fill(); }
+  ctx.fillStyle = "#fbfbf6"; ctx.beginPath(); ctx.arc(x,y,r,0,7); ctx.fill();
+  if (r > 7){
+    ctx.strokeStyle = "#c0382b"; ctx.lineWidth = Math.max(1,r*.09);
+    ctx.beginPath(); ctx.arc(x-r*1.05,y,r*.78,-.9,.9); ctx.stroke();
+    ctx.beginPath(); ctx.arc(x+r*1.05,y,r*.78,Math.PI-.9,Math.PI+.9); ctx.stroke();
+  }
+}
+function drawZoneBox(cx,cy,hw,hh){
+  const zx = cx-hw, zy = cy-hh, zw = hw*2, zh = hh*2;
+  ctx.fillStyle = "rgba(255,255,255,.09)"; ctx.fillRect(zx,zy,zw,zh);
+  ctx.strokeStyle = "rgba(255,255,255,.22)"; ctx.lineWidth = 1; ctx.beginPath();
+  for (let i=1;i<3;i++){
+    ctx.moveTo(zx+zw*i/3,zy); ctx.lineTo(zx+zw*i/3,zy+zh);
+    ctx.moveTo(zx,zy+zh*i/3); ctx.lineTo(zx+zw,zy+zh*i/3);
+  }
+  ctx.stroke();
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 3; ctx.lineCap = "square";
+  const c = 16; ctx.beginPath();
+  ctx.moveTo(zx,zy+c); ctx.lineTo(zx,zy); ctx.lineTo(zx+c,zy);
+  ctx.moveTo(zx+zw-c,zy); ctx.lineTo(zx+zw,zy); ctx.lineTo(zx+zw,zy+c);
+  ctx.moveTo(zx+zw,zy+zh-c); ctx.lineTo(zx+zw,zy+zh); ctx.lineTo(zx+zw-c,zy+zh);
+  ctx.moveTo(zx+c,zy+zh); ctx.lineTo(zx,zy+zh); ctx.lineTo(zx,zy+zh-c);
+  ctx.stroke();
+}
+function skyAndStands(h){
+  const g = ctx.createLinearGradient(0,0,0,h);
+  g.addColorStop(0,"#0a1430"); g.addColorStop(1,"#27345c");
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,h);
+  ctx.fillStyle = "#141c33"; ctx.fillRect(0,h-90,W,82);
+  for (let r=0;r<4;r++) for (let i=0;i<60;i++){
+    const x = (i*8.3 + r*3.7) % W, y = h-82 + r*17 + ((i*7)%5);
+    ctx.fillStyle = ["#e8d27a","#9ab6e8","#e58a7a","#cfd6e6"][(i+r)%4];
+    ctx.globalAlpha = .5; ctx.fillRect(x,y,3,4);
+  }
+  ctx.globalAlpha = 1;
+  for (const lx of [66, 414]){
+    const rg = ctx.createRadialGradient(lx,32,2,lx,32,125);
+    rg.addColorStop(0,"rgba(255,248,210,.8)"); rg.addColorStop(1,"rgba(255,248,210,0)");
+    ctx.fillStyle = rg; ctx.fillRect(lx-125,0,250,h);
+  }
+}
+
+/* ---------- batter's view ---------- */
+function drawBatScene(){
+  skyAndStands(200);
+  ctx.fillStyle = "#0f3b2a"; ctx.fillRect(0,186,W,16);
+  ctx.fillStyle = "#f2c230"; ctx.fillRect(0,186,W,3);
+  for (let i=0;i<14;i++){ ctx.fillStyle = i%2 ? "#2f7d3c" : "#379045"; ctx.fillRect(0,202+i*37.3,W,38); }
+  ctx.fillStyle = "#b9824d";
+  ctx.beginPath(); ctx.moveTo(214,268); ctx.lineTo(266,268); ctx.lineTo(430,H); ctx.lineTo(50,H); ctx.closePath(); ctx.fill();
+  ctx.fillStyle = "#c4905a"; ctx.beginPath(); ctx.ellipse(CX,274,34,12,0,0,7); ctx.fill();
+  ctx.fillStyle = "#fff"; ctx.fillRect(CX-7,271,14,3);
+  ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(CX,H+10); ctx.lineTo(-30,202); ctx.moveTo(CX,H+10); ctx.lineTo(W+30,202); ctx.stroke();
+  ctx.lineWidth = 2; ctx.strokeStyle = "rgba(255,255,255,.4)";
+  ctx.strokeRect(CX-118,548,64,100); ctx.strokeRect(CX+54,548,64,100);
+  ctx.fillStyle = "#f5f5f0"; ctx.beginPath();
+  ctx.moveTo(CX-26,556); ctx.lineTo(CX+26,556); ctx.lineTo(CX+26,574); ctx.lineTo(CX,590); ctx.lineTo(CX-26,574); ctx.closePath(); ctx.fill();
+  drawZoneBox(CX, BZ.y, BZ.w, BZ.h);
+  ctx.font = "16px " + BODY; ctx.textAlign = "center"; ctx.textBaseline = "middle";
+  ctx.fillStyle = "rgba(255,255,255,.7)"; ctx.fillText("Strike zone", CX, BZ.y+BZ.h+16);
+}
+function drawFarPitcher(){
+  let ang = 0;
+  if (S.phase === "flight" && S.pitch) ang = Math.PI * (1 - Math.min(1, S.pitch.t/.14));
+  const px = CX, py = 268;
+  ctx.fillStyle = "#e9ecf2"; ctx.fillRect(px-6,py-26,12,18);
+  ctx.fillStyle = "#33406b"; ctx.fillRect(px-6,py-10,5,12); ctx.fillRect(px+1,py-10,5,12);
+  ctx.fillStyle = "#e6b38c"; ctx.beginPath(); ctx.arc(px,py-31,5,0,7); ctx.fill();
+  ctx.fillStyle = "#c63b2f"; ctx.fillRect(px-5,py-37,10,4);
+  ctx.strokeStyle = "#e9ecf2"; ctx.lineWidth = 4; ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(px+6,py-23); ctx.lineTo(px+6+Math.sin(ang)*8, py-23+Math.cos(ang)*14); ctx.stroke();
+}
+function drawMyBat(){
+  const pvx = 410, pvy = 700, len = 190, rest = -1.0;
+  let a = rest;
+  if (S.bat && S.bat.x !== undefined){
+    const target = Math.atan2(S.bat.y - pvy, S.bat.x - pvx), k = S.bat.t;
+    if (k < .12){ const e = k/.12; a = lerp(rest, target, 1-Math.pow(1-e,3)); }
+    else a = lerp(target, rest, clamp((k-.12)/.23,0,1));
+  }
+  const ex = pvx + Math.cos(a)*len, ey = pvy + Math.sin(a)*len;
+  ctx.lineCap = "round";
+  ctx.strokeStyle = "#8a5a2b"; ctx.lineWidth = 7;
+  ctx.beginPath(); ctx.moveTo(pvx,pvy); ctx.lineTo(lerp(pvx,ex,.35),lerp(pvy,ey,.35)); ctx.stroke();
+  ctx.strokeStyle = "#d9a55f"; ctx.lineWidth = 15;
+  ctx.beginPath(); ctx.moveTo(lerp(pvx,ex,.35),lerp(pvy,ey,.35)); ctx.lineTo(ex,ey); ctx.stroke();
+  ctx.strokeStyle = "#f0c98a"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(lerp(pvx,ex,.4),lerp(pvy,ey,.4)-3); ctx.lineTo(ex,ey-3); ctx.stroke();
+}
+const BAT_FLY = {hr:{y:95,arc:230}, fly:{y:215,arc:170}, single:{y:335,arc:50}, double:{y:245,arc:70},
+  triple:{y:205,arc:60}, ground:{y:370,arc:0}, foul:{y:300,arc:110}};
+
+function drawBatView(){
+  drawBatScene(); drawFarPitcher();
+  const p = S.pitch, st = S.phase;
+  if (st === "flight" && p){
+    const z = p.t/p.dur;
+    if (z < 1.18){ const b = ballBatView(p,z); drawBall(b.x,b.y,b.r,true); }
+  }
+  if (st === "hit" && p){
+    const f = S.flight, u = f.t/f.dur, cfg = BAT_FLY[f.kind], s = ballBatView(p, f.zc);
+    const ex = clamp(CX + f.lat*220, 20, 460);
+    const x = lerp(s.x, ex, u); let y = lerp(s.y, cfg.y, u);
+    if (f.kind === "ground") y -= Math.abs(Math.sin(u*Math.PI*3))*14*(1-u); else y -= cfg.arc*4*u*(1-u);
+    drawBall(x,y,Math.max(3,lerp(s.r,4,Math.pow(u,.6))),true);
+  }
+  if (st === "result" && p && S.after && !IN_PLAY.includes("x")){
+    // mark where a taken pitch crossed
+    if (!p.swung){
+      const b = ballBatView(p,1);
+      ctx.fillStyle = p.inZone ? "#ffd95a" : "#8fc8ff"; ctx.strokeStyle = "#0b1428"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(b.x,b.y,8,0,7); ctx.fill(); ctx.stroke();
+    }
+  }
+  drawMyBat();
+  if (st === "flight" || st === "wait"){
+    ctx.strokeStyle = "rgba(255,217,90,.75)"; ctx.lineWidth = 2;
+    const pt = S.pointer;
+    if (st === "flight"){
+      ctx.beginPath(); ctx.arc(pt.x,pt.y,22,0,7); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(pt.x-30,pt.y); ctx.lineTo(pt.x-14,pt.y); ctx.moveTo(pt.x+14,pt.y); ctx.lineTo(pt.x+30,pt.y); ctx.stroke();
+    }
+  }
+}
+
+/* ---------- pitcher's view ---------- */
+function drawPitchScene(){
+  skyAndStands(170);
+  ctx.fillStyle = "#0f3b2a"; ctx.fillRect(0,168,W,86);
+  ctx.fillStyle = "#f2c230"; ctx.fillRect(0,168,W,3);
+  ctx.strokeStyle = "rgba(255,255,255,.07)"; ctx.lineWidth = 1; ctx.beginPath();
+  for (let x=0;x<=W;x+=16){ ctx.moveTo(x,171); ctx.lineTo(x,254); }
+  for (let y=171;y<=254;y+=14){ ctx.moveTo(0,y); ctx.lineTo(W,y); }
+  ctx.stroke();
+  for (let i=0;i<15;i++){ ctx.fillStyle = i%2 ? "#2f7d3c" : "#379045"; ctx.fillRect(0,254+i*33,W,34); }
+  ctx.fillStyle = "#b9824d"; ctx.beginPath(); ctx.ellipse(CX,420,215,125,0,0,7); ctx.fill();
+  ctx.fillStyle = "#c4905a"; ctx.beginPath(); ctx.ellipse(CX,722,230,62,0,0,7); ctx.fill();
+  ctx.fillStyle = "#f4f4ee"; ctx.fillRect(CX-30,672,60,7);
+  ctx.strokeStyle = "rgba(255,255,255,.85)"; ctx.lineWidth = 3;
+  ctx.beginPath(); ctx.moveTo(CX,428); ctx.lineTo(-120,H); ctx.moveTo(CX,428); ctx.lineTo(W+120,H); ctx.stroke();
+  ctx.lineWidth = 2; ctx.strokeStyle = "rgba(255,255,255,.45)";
+  ctx.strokeRect(CX-96,380,50,92); ctx.strokeRect(CX+46,380,50,92);
+  ctx.fillStyle = "#f5f5f0"; ctx.beginPath();
+  ctx.moveTo(CX-24,444); ctx.lineTo(CX+24,444); ctx.lineTo(CX+24,432); ctx.lineTo(CX,418); ctx.lineTo(CX-24,432); ctx.closePath(); ctx.fill();
+}
+function drawCatcher(){
+  ctx.fillStyle = "#1d2440"; ctx.beginPath(); ctx.ellipse(CX,372,56,46,0,0,7); ctx.fill();
+  ctx.fillStyle = "#2c3560"; ctx.beginPath(); ctx.ellipse(CX,360,40,30,0,0,7); ctx.fill();
+  ctx.fillStyle = "#14192f"; ctx.beginPath(); ctx.arc(CX,306,21,0,7); ctx.fill();
+  ctx.strokeStyle = "rgba(255,255,255,.2)"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.moveTo(CX-14,306); ctx.lineTo(CX+14,306); ctx.moveTo(CX,292); ctx.lineTo(CX,320); ctx.stroke();
+}
+function drawNearBatter(){
+  const bx = 142;
+  ctx.fillStyle = "#2d3a66"; ctx.fillRect(bx-17,402,13,64); ctx.fillRect(bx+2,402,13,64);
+  ctx.fillStyle = "#e9ecf2"; ctx.fillRect(bx-22,312,42,96);
+  ctx.fillStyle = "#cfd5e4"; ctx.fillRect(bx-22,312,42,10);
+  ctx.fillStyle = "#e6b38c"; ctx.beginPath(); ctx.arc(bx,296,12,0,7); ctx.fill();
+  ctx.fillStyle = "#3a6fd8"; ctx.beginPath(); ctx.arc(bx,292,14,Math.PI,0); ctx.fill(); ctx.fillRect(bx-14,290,34,4);
+  if (S.ctrl[batSide()] === "cpu") txt(S.cpuBatter.name, bx, 490, 20, "#ffffff", BODY);
+  const hx = bx + 26, hy = 338, rest = -1.45;
+  let a = rest;
+  if (S.bat){
+    const t = S.bat.t;
+    if (t < .22){ const e = t/.22; a = lerp(rest, .25, 1-Math.pow(1-e,3)); } else a = lerp(.25, .6, clamp((t-.22)/.2,0,1));
+  }
+  const len = 150, ex = hx + Math.cos(a)*len, ey = hy + Math.sin(a)*len;
+  ctx.lineCap = "round";
+  ctx.strokeStyle = "#e9ecf2"; ctx.lineWidth = 8; ctx.beginPath(); ctx.moveTo(bx+10,324); ctx.lineTo(hx,hy); ctx.stroke();
+  ctx.strokeStyle = "#8a5a2b"; ctx.lineWidth = 6; ctx.beginPath(); ctx.moveTo(hx,hy); ctx.lineTo(lerp(hx,ex,.4),lerp(hy,ey,.4)); ctx.stroke();
+  ctx.strokeStyle = "#d9a55f"; ctx.lineWidth = 13; ctx.beginPath(); ctx.moveTo(lerp(hx,ex,.4),lerp(hy,ey,.4)); ctx.lineTo(ex,ey); ctx.stroke();
+}
+function drawMitt(x,y,alpha=1){
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = "#7a4a22"; ctx.beginPath(); ctx.arc(x,y,17,0,7); ctx.fill();
+  ctx.fillStyle = "#a8692f"; ctx.beginPath(); ctx.arc(x,y,11,0,7); ctx.fill();
+  ctx.strokeStyle = "#f2c230"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(x,y,17,0,7); ctx.stroke();
+  ctx.globalAlpha = 1;
+}
+const clampAim = (x,y) => ({x:clamp(x,CX-110,CX+110), y:clamp(y,PZ.y-100,PZ.y+100)});
+const PV_FLY = {foul:{y:200,arc:100,r:22}, ground:{y:700,arc:0,r:30}, fly:{y:520,arc:330,r:34},
+  single:{y:690,arc:70,r:34}, double:{y:600,arc:120,r:38}, triple:{y:640,arc:110,r:40}, hr:{y:-60,arc:80,r:70}};
+
+function drawPitchView(){
+  drawPitchScene(); drawCatcher(); drawNearBatter(); drawZoneBox(CX, PZ.y, PZ.w, PZ.h);
+  const st = S.phase, p = S.pitch;
+  if (st === "aim"){
+    const a = clampAim(S.pointer.x, S.pointer.y);
+    drawMitt(a.x,a.y,.55);
+    ctx.strokeStyle = "rgba(255,217,90,.85)"; ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(a.x,a.y,6,0,7); ctx.stroke();
+  } else if (st === "meter"){
+    drawMitt(S.aim.x,S.aim.y);
+    const r = scatterR(meterError());
+    ctx.setLineDash([5,5]); ctx.strokeStyle = "rgba(255,217,90,.9)"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(S.aim.x,S.aim.y,Math.max(r,4),0,7); ctx.stroke(); ctx.setLineDash([]);
+  } else if (p && st === "flight" && p.ax !== undefined) drawMitt(p.ax,p.ay);
+
+  if (p){
+    const tx = CX + p.nx*PZ.w, ty = PZ.y + p.ny*PZ.h;
+    if (st === "flight"){
+      const z = p.t/p.dur;
+      if (z < 1){ const b = ballPitchView(p,z); drawBall(b.x,b.y,b.r); } else drawBall(tx,ty,8);
+    }
+    if (st === "result" && !IN_PLAY.includes(S.lastKind || "")){
+      if (!S.flight){ drawMitt(tx,ty); drawBall(tx,ty,8); }
+    }
+    if (st === "hit"){
+      const f = S.flight, u = f.t/f.dur, cfg = PV_FLY[f.kind];
+      const ex = clamp(CX - f.lat*160, -40, W+40);
+      const x = lerp(tx,ex,u); let y = lerp(ty,cfg.y,u);
+      if (f.kind === "ground") y -= Math.abs(Math.sin(u*Math.PI*3))*22*(1-u); else y -= cfg.arc*4*u*(1-u);
+      drawBall(x,y,lerp(8,cfg.r,Math.pow(u,.8)));
+    }
+  }
+}
+
+function drawMeter(){
+  const x0 = 80, x1 = 400, y = 650, h = 24;
+  const g = ctx.createLinearGradient(x0,0,x1,0);
+  g.addColorStop(0,"#b3392c"); g.addColorStop(.32,"#d49a2e"); g.addColorStop(.5,"#6fd08c");
+  g.addColorStop(.68,"#d49a2e"); g.addColorStop(1,"#b3392c");
+  ctx.fillStyle = "rgba(6,12,22,.9)"; ctx.fillRect(x0-6,y-6,x1-x0+12,h+12);
+  ctx.fillStyle = g; ctx.fillRect(x0,y,x1-x0,h);
+  ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.strokeRect(lerp(x0,x1,.42),y-3,(x1-x0)*.16,h+6);
+  ctx.fillStyle = "#fff"; ctx.fillRect(lerp(x0,x1,S.meter.m)-3,y-8,6,h+16);
+  txt(PITCHES[S.sel].name + ": tap when the marker hits the gold", CX, 622, 22, "#ffffff", BODY);
+  txt("Better timing means a tighter spot", CX, 700, 18, "rgba(255,255,255,.7)", BODY, "center", false);
+}
+function drawButtons(){
+  BTN.forEach(b => {
+    const on = b.i === S.sel, T = PITCHES[b.i];
+    ctx.fillStyle = on ? "#f2c230" : "rgba(8,16,30,.88)"; ctx.fillRect(b.x,b.y,b.w,b.h);
+    ctx.strokeStyle = on ? "#fff" : "rgba(255,255,255,.25)"; ctx.lineWidth = on ? 3 : 1.5; ctx.strokeRect(b.x,b.y,b.w,b.h);
+    txt(T.name, b.x+b.w/2, b.y+26, 23, on ? "#0b1428" : "#fff", BODY, "center", false);
+    txt(T.desc, b.x+b.w/2, b.y+50, 17, on ? "#33291a" : "#a9b8d3", BODY, "center", false);
+  });
+}
+
+/* ---------- HUD, banner, overlays ---------- */
+function drawHUD(){
+  const v = V, bs = v.half === "top" ? 0 : 1;
+  ctx.fillStyle = "rgba(6,12,22,.84)"; ctx.fillRect(0,0,W,76);
+  ctx.fillStyle = "#f2c230"; ctx.fillRect(0,76,W,2);
+  txt((v.half === "top" ? "Top " : "Bottom ") + v.inning + "  " + S.names[bs] + " at bat", 14, 22, 20, "#cfd8ea", BODY, "left", false);
+  txt(S.names[0] + " " + v.score[0] + "   " + S.names[1] + " " + v.score[1], 14, 52, 24, "#ffd95a", DISPLAY, "left", false);
+  txt("B " + v.balls + "   S " + v.strikes, 300, 22, 22, "#fff", BODY, "center", false);
+  for (let i=0;i<3;i++){
+    ctx.beginPath(); ctx.arc(268+i*18, 52, 6.5, 0, 7);
+    ctx.fillStyle = i < v.outs ? "#ffd95a" : "rgba(255,255,255,.18)"; ctx.fill();
+  }
+  txt("Outs", 328, 52, 18, "#9fb0cc", BODY, "left", false);
+  const bx = 432, by = 38, pos = [[bx+22,by],[bx,by-20],[bx-22,by]];
+  for (let i=0;i<3;i++){
+    ctx.save(); ctx.translate(pos[i][0], pos[i][1]+10); ctx.rotate(Math.PI/4);
+    ctx.fillStyle = v.bases[i] ? "#ffd95a" : "rgba(255,255,255,.16)"; ctx.fillRect(-8,-8,16,16); ctx.restore();
+  }
+}
+function drawBanner(){
+  const b = S.banner; if (!b) return;
+  const e = Math.min(1, b.t/.18), s = .8 + .2*(1-Math.pow(1-e,3));
+  ctx.save(); ctx.translate(CX, S.view === "bat" ? 350 : 540); ctx.scale(s,s); ctx.globalAlpha = Math.min(1,b.t/.1);
+  txt(b.text, 0, 0, b.text.length > 16 ? 34 : 48, b.color, DISPLAY);
+  if (b.sub) txt(b.sub, 0, 42, 26, "#fff", BODY);
+  ctx.restore();
+}
+function dim(a=.82){ ctx.fillStyle = "rgba(5,10,20," + a + ")"; ctx.fillRect(0,0,W,H); }
+function btn(b, primary=true){
+  ctx.fillStyle = primary ? "#f2c230" : "rgba(255,255,255,.12)"; ctx.fillRect(b.x,b.y,b.w,b.h);
+  if (!primary){ ctx.strokeStyle = "rgba(255,255,255,.35)"; ctx.lineWidth = 1.5; ctx.strokeRect(b.x,b.y,b.w,b.h); }
+  txt(b.label, b.x+b.w/2, b.y+b.h/2+1, 30, primary ? "#0b1428" : "#d6e0f2", BODY, "center", false);
+}
+const inRect = (pt,b) => pt.x >= b.x && pt.x <= b.x+b.w && pt.y >= b.y && pt.y <= b.y+b.h;
+
+function overBtns(){
+  return S.mode === "online"
+    ? [{x:90,y:540,w:300,h:56,label:"Main menu",act:"menu"}]
+    : [{x:90,y:520,w:300,h:56,label:"Play again",act:"again"},{x:90,y:590,w:300,h:56,label:"Main menu",act:"menu"}];
+}
+
+function drawOverlays(){
+  const st = S.phase;
+  if (st === "menu" || st === "lobby"){
+    dim(.8);
+    txt("Night Game", CX, 190, 54, "#ffd95a", DISPLAY);
+    txt("Showdown", CX, 248, 54, "#fff", DISPLAY);
+    if (st === "menu"){
+      txt("Bat and pitch. Every half inning you switch roles.", CX, 296, 22, "#b8c5de", BODY, "center", false);
+      MENU_BTN.forEach(b => btn(b));
+      txt("Three innings. Most runs wins.", CX, 590, 22, "#b8c5de", BODY, "center", false);
+    }
+  }
+  if (st === "handoff"){
+    dim(.94);
+    const h = S.handoff;
+    txt("Pass to " + S.full[h.side], CX, 290, 46, "#ffd95a", DISPLAY);
+    txt("You " + (h.role === "pitcher" ? "pitch" : "bat") + " this one", CX, 350, 30, "#fff", BODY, "center", false);
+    ctx.globalAlpha = .75 + .25*Math.sin(performance.now()/260);
+    ctx.fillStyle = "#f2c230"; ctx.fillRect(CX-130, 420, 260, 56); ctx.globalAlpha = 1;
+    txt("Tap when ready", CX, 449, 30, "#0b1428", BODY, "center", false);
+  }
+  if (st === "over"){
+    dim(.84);
+    let t1, t2;
+    if (G.winner === -1){ t1 = "Tie"; t2 = "game"; }
+    else if (S.mode === "pass"){ t1 = S.full[G.winner]; t2 = "wins!"; }
+    else if (S.ctrl[G.winner] === "human"){ t1 = "You"; t2 = "win!"; }
+    else { t1 = S.mode === "cpu" ? "CPU" : "Opponent"; t2 = "wins"; }
+    txt(t1, CX, 205, 52, "#ffd95a", DISPLAY); txt(t2, CX, 262, 52, "#fff", DISPLAY);
+    txt("Final: " + S.full[0] + " " + G.score[0] + ", " + S.full[1] + " " + G.score[1], CX, 340, 28, "#fff", BODY, "center", false);
+    txt(G.inning > INN ? "Went to extra innings." : "", CX, 376, 22, "#b8c5de", BODY, "center", false);
+    overBtns().forEach((b,i) => btn(b, i === 0));
+  }
+  if (S.msgT > 0 && S.msg){
+    ctx.fillStyle = "rgba(6,12,22,.92)"; ctx.fillRect(30,92,420,40);
+    txt(S.msg, CX, 112, 20, "#ffd95a", BODY, "center", false);
+  }
+}
+
+function draw(){
+  if (S.view === "bat") drawBatView(); else drawPitchView();
+  for (const q of S.particles){ ctx.fillStyle = q.c; ctx.globalAlpha = clamp(q.life,0,1); ctx.fillRect(q.x,q.y,q.s,q.s); }
+  ctx.globalAlpha = 1;
+  const st = S.phase;
+  if (st !== "menu" && st !== "lobby") drawHUD();
+  if (S.info && (st === "flight" || st === "hit" || st === "result")) txt(S.info, CX, 100, 24, "#fff", BODY);
+  drawBanner();
+  if (st === "aim"){
+    drawButtons();
+    txt("Pick a pitch, then tap where you want it", CX, 612, 20, "rgba(255,255,255,.85)", BODY);
+  }
+  if (st === "meter") drawMeter();
+  if (st === "wait") txt("Waiting for the pitch...", CX, 600, 26, "#fff", BODY);
+  if (st === "flight" && S.view === "bat") txt("Tap the ball when it reaches the zone", CX, 706, 20, "rgba(255,255,255,.7)", BODY, "center", false);
+  if (st === "flight" && S.view === "pitch" && S.ctrl[batSide()] === "remote" && S.pitch.t > S.pitch.dur && !S.pending)
+    txt("Waiting for the batter...", CX, 600, 24, "#fff", BODY);
+  drawOverlays();
+}
+
+/* ---------- input ---------- */
+function toCanvas(e){
+  const r = cv.getBoundingClientRect();
+  return {x:(e.clientX-r.left)*W/r.width, y:(e.clientY-r.top)*H/r.height};
+}
+function choose(act){
+  if (act === "cpu" || act === "pass") startGame(act, 0);
+  else if (act === "online"){ S.phase = "lobby"; lobby.hidden = false; setStat("Create a game and send the code to a friend, or enter the code they sent you."); }
+  else if (act === "again") startGame(S.mode, S.me);
+  else if (act === "menu"){ leaveRoom(); S.phase = "menu"; S.view = "pitch"; V = snapG(); S.pitch = null; S.flight = null; S.bat = null; S.banner = null; }
+}
+function press(pt){
+  switch (S.phase){
+    case "menu": for (const b of MENU_BTN) if (inRect(pt,b)) choose(b.act); break;
+    case "over": if (performance.now() - S.overAt > 500) for (const b of overBtns()) if (inRect(pt,b)) choose(b.act); break;
+    case "handoff": { const h = S.handoff; S.lastActor = h.side; S.phase = h.phase; S.handoff = null; break; }
+    case "aim":
+      if (pt.y >= 626){
+        for (const b of BTN) if (inRect(pt,b)){ S.sel = b.i; tone(500,.05,"triangle",.04); }
+      } else if (pt.y > 90){ S.aim = clampAim(pt.x, pt.y); S.meter = {m:0,dir:1}; S.phase = "meter"; }
+      break;
+    case "meter": release(); break;
+    case "flight": swing(pt.x, pt.y); break;
+  }
+}
+cv.addEventListener("pointermove", e => { S.pointer = toCanvas(e); });
+cv.addEventListener("pointerdown", e => { e.preventDefault(); S.pointer = toCanvas(e); press(S.pointer); });
+window.addEventListener("keydown", e => {
+  if (S.phase === "aim" && e.code >= "Digit1" && e.code <= "Digit4"){ S.sel = +e.code.slice(5) - 1; return; }
+  if (e.code === "Space" || e.code === "Enter"){
+    if (document.activeElement && document.activeElement.tagName === "INPUT") return;
+    e.preventDefault();
+    if (S.phase === "aim") press({x:S.pointer.x, y:Math.min(S.pointer.y,600)});
+    else if (S.phase !== "menu" && S.phase !== "over") press(S.pointer);
+  }
+});
+
+/* lobby DOM */
+const codeEl = document.getElementById("code");
+document.getElementById("bcreate").addEventListener("click", () => {
+  const A = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"; let c = "";
+  for (let i=0;i<4;i++) c += A[Math.floor(Math.random()*A.length)];
+  goOnline(c, true);
+});
+document.getElementById("bjoin").addEventListener("click", () => {
+  const c = codeEl.value.trim().replace(/[^A-Za-z0-9]/g,"");
+  if (c.length < 3){ setStat("Enter the code your friend sent you."); return; }
+  goOnline(c, false);
+});
+document.getElementById("bback").addEventListener("click", () => {
+  leaveRoom(); lobby.hidden = true; S.phase = "menu";
+});
+
+/* ---------- loop ---------- */
+V = snapG();
+S.view = "pitch";
+let last = performance.now();
+function frame(now){
+  const dt = Math.min(.05, (now-last)/1000); last = now;
+  if (S.phase === "flight" && S.pitch && S.phase === "flight" && S.pending && S.ctrl[batSide()] === "remote") {/* handled in update */}
+  update(dt); draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+window.__ngs = {S, G, press, startGame, update, draw, applyKind, snapG};
+})();
+</script>
+</body>
+</html>
